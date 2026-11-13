@@ -43,7 +43,7 @@
 	var/list/mutant_labels_cache
 	var/tmp/heavy_static_pending = FALSE
 	var/character_revision = 0
-	var/loadout_selected = FALSE
+	var/loadout_selected = TRUE
 	var/list/viewer_screens
 	var/preview_mode = PREVIEW_PREF_JOB
 	var/preview_auto_fit = TRUE
@@ -84,8 +84,8 @@
 		"modified_limbs", "organ_mods", "implant_mods", "chosen_limb_id", "body_weight", "scars_list", "bgstate",
 		"custom_speech_verb", "custom_speech_verb_ru", "custom_tongue", "custom_laugh", "language",
 		"bark_id", "bark_speed", "bark_pitch", "bark_variance", "enable_personal_chat_color", "personal_chat_color",
-		"loadout_slot", "loadout_enabled", "loadout_data", "all_quirks", "antag_opt_in_level",
-		"phobia_type", "shriek_type", "onelife_death_type", "summon_nickname", "vore_taste", "vore_smell",
+		"loadout_slot", "loadout_enabled", "loadout_data", "all_quirks", "innate_features", "antag_opt_in_level",
+		"phobia_type", "shriek_type", "onelife_death_type", "summon_nickname", "distant_start_enabled", "vore_taste", "vore_smell",
 		"security_records", "medical_records", "underwear", "undershirt", "socks", "undie_color", "shirt_color", "socks_color",
 		"job_preferences", "joblessrole", "alt_titles_preferences", "persistent_tattoos", "tattoos_string", "pending_tattoo_removals",
 		"character_presets", "active_character_preset",
@@ -107,6 +107,7 @@
 	var/static/list/fields = list(
 		"job_preferences", "joblessrole", "alt_titles_preferences", "prefered_security_department",
 		"all_quirks", "phobia_type", "shriek_type", "onelife_death_type", "summon_nickname", "loadout_enabled",
+		"organ_mods", "implant_mods", "distant_start_enabled",
 	)
 	return fields
 
@@ -126,6 +127,11 @@
 				snapshot[field] = deepCopyList(preset[field])
 			snapshot["alt_titles_preferences"] = SANITIZE_LIST(snapshot["alt_titles_preferences"])
 			snapshot["loadout"] = deepCopyList(preset["loadout"])
+			// Старые пресеты хранят эти модификации в квирках; переносим каждый набор независимо.
+			snapshot["organ_mods"] = SANITIZE_LIST(snapshot["organ_mods"])
+			snapshot["implant_mods"] = SANITIZE_LIST(snapshot["implant_mods"])
+			snapshot["distant_start_enabled"] = sanitize_integer(snapshot["distant_start_enabled"], FALSE, TRUE, TRUE)
+			migrate_legacy_body_mods(snapshot["all_quirks"], snapshot["organ_mods"], snapshot["implant_mods"])
 			sanitized[preset_name] = snapshot
 	character_presets = sanitized
 	if(!istext(active_character_preset) || !islist(character_presets[active_character_preset]))
@@ -157,8 +163,6 @@
 			positive_count++
 	if(positive_count > MAX_QUIRKS)
 		return "В пресете больше [MAX_QUIRKS] положительных квирков."
-	if(quirk_balance(quirks) < 0)
-		return "Для этих квирков не хватает баланса при текущем весе, протезах и модификациях персонажа."
 	var/points = available_gear_points(user)
 	var/list/seen_gear = list()
 	for(var/raw_entry in preset["loadout"])
@@ -181,6 +185,50 @@
 	if(points < 0)
 		return "Для комплекта пресета не хватает очков экипировки."
 	return null
+
+// Одна проверка комплекта для ручного применения пресета и восстановления рабочего слота при входе.
+/datum/preferences/proc/clean_character_preset_loadout(list/preset, mob/user)
+	var/list/removed = list()
+	var/list/clean_loadout = list()
+	var/list/seen_gear = list()
+	var/points = available_gear_points(user)
+	var/account_key = user?.key || parent?.key
+	for(var/raw_entry in preset["loadout"])
+		var/list/entry = islist(raw_entry) ? raw_entry : null
+		var/datum/gear/gear = entry && istext(entry[LOADOUT_ITEM]) ? find_loadout_gear(entry[LOADOUT_ITEM]) : null
+		if(!gear)
+			removed += "предмет [entry ? entry[LOADOUT_ITEM] : "без идентификатора"]"
+			continue
+		if((gear.type in seen_gear) || (gear.donoritem && !gear.donator_ckey_check(account_key)) || (istype(gear, /datum/gear/unlockable) && !can_use_unlockable(gear)) || gear.cost > points)
+			removed += gear.name
+			continue
+		points -= gear.cost
+		seen_gear += gear.type
+		clean_loadout += list(entry)
+	preset["loadout"] = clean_loadout
+	return removed
+
+// Убираем устаревшие и недоступные записи, сохраняя остальную часть пресета.
+/datum/character_setup/proc/clean_character_preset(list/preset, mob/user)
+	var/list/removed = list()
+	var/list/quirks = preset["all_quirks"]
+	var/positive_count = 0
+	for(var/quirk_name in quirks.Copy())
+		var/datum/quirk/quirk_datum = istext(quirk_name) ? SSquirks.quirks[quirk_name] : null
+		if(!quirk_datum || quirk_lock_reason(quirk_name, quirk_datum, quirks))
+			quirks -= list(quirk_name)
+			removed += "[quirk_name]"
+			continue
+		if(initial(quirk_datum.value) > 0 && ++positive_count > MAX_QUIRKS)
+			quirks -= quirk_name
+			removed += quirk_name
+	removed += prefs.clean_character_preset_loadout(preset, user)
+	var/list/jobs = preset["job_preferences"]
+	for(var/job_title in jobs.Copy())
+		if(!istext(job_title) || !SSjob.GetJob(job_title))
+			jobs -= list(job_title)
+			removed += "профессия [job_title]"
+	return removed
 
 /datum/character_setup/proc/manage_character_preset(action, list/params, mob/user)
 	var/slot = prefs.default_slot
@@ -238,6 +286,11 @@
 			selected_character_preset = null
 			save_notice = "Пресет «[preset_name]» удалён. Текущие настройки персонажа оставлены без изменений."
 		if("preset_apply")
+			if(!length(SSquirks?.quirks) || !SSjob?.initialized || !length(GLOB.loadout_items))
+				save_notice = "Справочники профессий, квирков или экипировки ещё загружаются."
+				return
+			preset = deepCopyList(preset)
+			var/list/removed = clean_character_preset(preset, user)
 			var/error = character_preset_error(preset, user)
 			if(error)
 				save_notice = "Пресет не применён: [error]"
@@ -247,17 +300,24 @@
 				prefs.vars[field] = deepCopyList(preset[field])
 			prefs.joblessrole = sanitize_inlist(prefs.joblessrole, list(RETURNTOLOBBY, BEOVERFLOW, BERANDOMJOB), RETURNTOLOBBY)
 			prefs.loadout_enabled = sanitize_integer(prefs.loadout_enabled, FALSE, TRUE, TRUE)
+			prefs.sanitize_body_mods()
+			prefs.distant_start_enabled = sanitize_integer(prefs.distant_start_enabled, FALSE, TRUE, TRUE)
 			prefs.prefered_security_department = sanitize_inlist(prefs.prefered_security_department, GLOB.security_depts_prefs, SEC_DEPT_RANDOM)
 			prefs.shriek_type = sanitize_inlist(prefs.shriek_type, GLOB.shriek_types, SHRIEK_TYPE_GENERIC)
 			prefs.onelife_death_type = sanitize_inlist(prefs.onelife_death_type, GLOB.onelife_death_forms, "Пепел")
 			if(SStraumas)
 				prefs.phobia_type = SStraumas.sanitize_phobia_type(prefs.phobia_type)
+			prefs.character_presets[preset_name] = preset
 			activate_character_preset_loadout(preset_name, preset)
 			if(prefs.job_menu)
 				prefs.job_menu.previews.Cut()
 				prefs.job_menu.pushed_preview = null
 				SStgui.update_uis(prefs.job_menu)
 			save_notice = "Применён пресет «[preset_name]». Используется отдельный комплект «Пресет»."
+			if(length(removed))
+				save_notice += " Отключены недоступные записи: [jointext(removed, ", ")]."
+			if(quirk_balance() < 0)
+				save_notice += " Не хватает очков особенностей: скорректируйте их набор или модификации перед входом в раунд."
 
 /datum/character_setup/proc/activate_character_preset_loadout(preset_name, list/preset)
 	prefs.loadout_data["SAVE_[LOADOUT_PRESET_SLOT]"] = deepCopyList(preset["loadout"])
@@ -417,9 +477,11 @@
 
 	var/list/body_size_field = num_ff("body_size", "Размер тела, %", CONFIG_GET(number/body_size_min) * 100, CONFIG_GET(number/body_size_max) * 100)
 	body_size_field["scale"] = 100
+	body_size_field["step"] = 0.5
 	fields += list(body_size_field)
 	var/list/norm_field = num_ff("normalized_size", "Нормализованный размер, %", max(CONFIG_GET(number/body_size_min), 0.81) * 100, min(CONFIG_GET(number/body_size_max), 1.2) * 100)
 	norm_field["scale"] = 100
+	norm_field["step"] = 0.5
 	fields += list(norm_field)
 	fields += list(ff("fuzzy", "Размытые пиксели", FEATURE_BOOL, FEATURE_SCOPE_PREF))
 
@@ -1043,7 +1105,7 @@
 	data["hasMarkings"] = length(entries) > 0
 	data["total"] = length(entries)
 
-	var/list/grid = list("Head", "Right Leg", "Chest", "Left Arm", "Left Leg", "Right Arm")
+	var/list/grid = list("Head", "Chest", "Left Arm", "Right Arm", "Left Leg", "Right Leg")
 	var/list/limbs = list()
 	for(var/limb in grid)
 		var/list/rows = list()
@@ -1743,10 +1805,14 @@
 	return data
 
 /datum/character_setup/proc/available_gear_points(mob/user)
+	return prefs.available_gear_points(user)
+
+/datum/preferences/proc/available_gear_points(mob/user)
+	var/account_ckey = user?.ckey || parent?.ckey
 	. = CONFIG_GET(number/initial_gear_points)
-	if(IS_CKEY_DONATOR_GROUP(user?.ckey, DONATOR_GROUP_TIER_1))
+	if(IS_CKEY_DONATOR_GROUP(account_ckey, DONATOR_GROUP_TIER_1))
 		. += CONFIG_GET(number/subscriber_extra_gear_points)
-	if(IS_CKEY_DONATOR_GROUP(user?.ckey, DONATOR_GROUP_TIER_2))
+	if(IS_CKEY_DONATOR_GROUP(account_ckey, DONATOR_GROUP_TIER_2))
 		. += CONFIG_GET(number/sponsor_extra_gear_points)
 
 /datum/character_setup/proc/calc_gear_points(mob/user)
@@ -1862,13 +1928,16 @@
 	return row
 
 /datum/character_setup/proc/find_loadout_gear(name)
+	return prefs.find_loadout_gear(name)
+
+/datum/preferences/proc/find_loadout_gear(name)
 	// В обзоре выбранного вещи относятся к разным категориям; идентификатор проверяем по каталогу.
 	var/gear_path = text2path(name)
 	if(ispath(gear_path, /datum/gear))
 		var/datum/gear/gear_type = gear_path
 		var/datum/gear/gear = GLOB.loadout_items[initial(gear_type.category)]?[initial(gear_type.subcategory)]?[initial(gear_type.name)]
 		return gear?.type == gear_path ? gear : null
-	var/list/subcategory_items = GLOB.loadout_items[prefs.gear_category]?[prefs.gear_subcategory]
+	var/list/subcategory_items = GLOB.loadout_items[gear_category]?[gear_subcategory]
 	return subcategory_items?[name]
 
 /datum/character_setup/proc/build_invalid_loadout_rows()
@@ -2731,8 +2800,9 @@
 	if(prefs.all_quirks.Find(/datum/quirk/bluemoon_devourer::name))
 		to_chat(usr, span_warning("Квирк Пожиратель несовместим с любым весом кроме стандартного."))
 		return
-	var/balance_check = prefs.GetQuirkBalance() - prefs.mob_size_name_to_quirk_cost(new_weight) + prefs.mob_size_name_to_quirk_cost(prefs.body_weight)
-	if(balance_check < 0)
+	var/balance = quirk_balance()
+	var/balance_check = balance - prefs.mob_size_name_to_quirk_cost(new_weight) + prefs.mob_size_name_to_quirk_cost(prefs.body_weight)
+	if(balance_check < min(0, balance))
 		to_chat(usr, span_warning("Для взятия данного веса нужно ещё [abs(balance_check)] очков квирков."))
 		return
 	prefs.body_weight = new_weight
@@ -2758,15 +2828,8 @@
 	var/old_bonus = 0
 	var/list/current_entry = prefs.modified_limbs[zone]
 	if(islist(current_entry) && length(current_entry))
-		if(current_entry[1] == LOADOUT_LIMB_PROSTHETIC)
-			old_bonus = 1
-		else if(current_entry[1] == LOADOUT_LIMB_AMPUTATED)
-			old_bonus = 2
-	var/new_bonus = 0
-	if(kind == LOADOUT_LIMB_PROSTHETIC)
-		new_bonus = 1
-	else if(kind == LOADOUT_LIMB_AMPUTATED)
-		new_bonus = 2
+		old_bonus = prefs.limb_modification_bonus(current_entry[1])
+	var/new_bonus = prefs.limb_modification_bonus(kind)
 	if(new_bonus < old_bonus && quirk_balance() - old_bonus + new_bonus < 0)
 		to_chat(usr, span_warning("Изменение этой конечности увёло бы баланс в минус!"))
 		return
@@ -2810,11 +2873,14 @@
 		old_cost = old_option["cost"]
 	if(isnull(option["path"]))
 		prefs.organ_mods -= slot
+		preview_dirty = TRUE
 		return
-	if(quirk_balance() + old_cost - option["cost"] < 0)
+	var/balance = quirk_balance()
+	if(balance + old_cost - option["cost"] < min(0, balance))
 		to_chat(user, span_warning("Недостаточно баланса: нужно ещё [option["cost"] - quirk_balance() - old_cost] очков квирков."))
 		return
 	prefs.organ_mods[slot] = option["id"]
+	preview_dirty = TRUE
 
 /datum/character_setup/proc/toggle_body_implant(list/params)
 	var/mob/user = prefs.parent?.mob
@@ -2824,16 +2890,19 @@
 	var/list/option = prefs.body_mod_implant_option(implant_id)
 	if(!option)
 		return
+	var/balance = quirk_balance()
 	if(prefs.implant_mods[implant_id])
-		if(quirk_balance() + option["cost"] < 0)
+		if(balance + option["cost"] < min(0, balance))
 			to_chat(user, span_warning("Возврат этого импланта увёл бы баланс в минус!"))
 			return
 		prefs.implant_mods -= implant_id
+		preview_dirty = TRUE
 		return
-	if(quirk_balance() - option["cost"] < 0)
+	if(balance - option["cost"] < min(0, balance))
 		to_chat(user, span_warning("Недостаточно баланса для этого импланта!"))
 		return
 	prefs.implant_mods[implant_id] = TRUE
+	preview_dirty = TRUE
 
 /datum/character_setup/proc/build_options_static()
 	if(options_cache)
@@ -2921,6 +2990,8 @@
 			data["quirksTab"] = build_quirks_data()
 		if(MODIFICATIONS_CHAR_TAB)
 			data["modsTab"] = build_modifications_data()
+		if(INNATE_CHAR_TAB)
+			data["innateTab"] = build_innate_data()
 
 	if(prefs.character_settings_tab == GENERAL_CHAR_TAB || prefs.character_settings_tab == APPEARANCE_CHAR_TAB)
 		data["appearance"] = build_appearance_data(user, prefs.character_settings_tab == APPEARANCE_CHAR_TAB)
@@ -2958,6 +3029,7 @@
 		list("id" = MODIFICATIONS_CHAR_TAB, "label" = "Модификации", "icon" = "robot"),
 		list("id" = SPEECH_CHAR_TAB, "label" = "Речь", "icon" = "comment"),
 		list("id" = QUIRKS_CHAR_TAB, "label" = "Особенности", "icon" = "brain"),
+		list("id" = INNATE_CHAR_TAB, "label" = "Врожденное", "icon" = "dna"),
 		list("id" = LOADOUT_CHAR_TAB, "label" = "Экипировка", "icon" = "tshirt"),
 	)
 
@@ -3026,22 +3098,7 @@
 /datum/character_setup/proc/quirk_balance(list/selected_quirks)
 	if(isnull(selected_quirks))
 		selected_quirks = prefs.all_quirks
-	var/balance = 0
-	var/list/quirk_datums = SSquirks ? SSquirks.quirks : list()
-	for(var/quirk_name in selected_quirks)
-		var/datum/quirk/quirk_datum = quirk_datums[quirk_name]
-		if(!quirk_datum)
-			continue
-		balance -= initial(quirk_datum.value)
-	for(var/modification in prefs.modified_limbs)
-		var/limb_kind = prefs.modified_limbs[modification][1]
-		if(limb_kind == LOADOUT_LIMB_PROSTHETIC)
-			balance += 1
-		else if(limb_kind == LOADOUT_LIMB_AMPUTATED)
-			balance += 2
-	balance -= prefs.mob_size_name_to_quirk_cost(prefs.body_weight)
-	balance -= prefs.body_mods_cost()
-	return balance
+	return prefs.quirk_balance(selected_quirks)
 
 /datum/character_setup/proc/quirk_lock_reason(quirk_name, datum/quirk/quirk_datum, list/selected_quirks)
 	if(isnull(selected_quirks))
@@ -3116,6 +3173,7 @@
 	data["shriekOptions"] = shriek_options
 
 	data["summonNickname"] = prefs.summon_nickname
+	data["distantStartEnabled"] = prefs.distant_start_enabled
 
 	data["phobia"] = prefs.phobia_type || "Случайная"
 	var/list/phobia_options = list("Случайная")
@@ -3158,6 +3216,7 @@
 	var/list/limbs = list()
 	var/prosthetic_count = 0
 	var/amputation_count = 0
+	var/limb_bonus = 0
 	for(var/zone in LOADOUT_ALLOWED_LIMB_TARGETS)
 		var/list/entry = prefs.modified_limbs[zone]
 		var/list/row = list("zone" = zone, "kind" = LOADOUT_LIMB_NORMAL)
@@ -3169,14 +3228,19 @@
 			prosthetic_count++
 		else if(row["kind"] == LOADOUT_LIMB_AMPUTATED)
 			amputation_count++
+		limb_bonus += prefs.limb_modification_bonus(row["kind"])
 		limbs += list(row)
 	data["limbs"] = limbs
 	data["limbKinds"] = LOADOUT_LIMBS
 	data["limbBrands"] = list("prosthetic") + GLOB.prosthetic_limb_types
 	data["prostheticCount"] = prosthetic_count
 	data["amputationCount"] = amputation_count
-	data["limbBonus"] = prosthetic_count + amputation_count * 2
+	data["limbBonus"] = limb_bonus
 	data["maxProsthetics"] = MAXIMUM_LOADOUT_PROSTHETICS
+	data["prostheticBonus"] = prefs.limb_modification_bonus(LOADOUT_LIMB_PROSTHETIC)
+	data["amputationBonus"] = prefs.limb_modification_bonus(LOADOUT_LIMB_AMPUTATED)
+	data["limbMaxDamage"] = /obj/item/bodypart/l_arm::max_damage
+	data["prostheticMaxDamage"] = /obj/item/bodypart/l_arm/robot/surplus::max_damage
 
 	var/list/groups = list()
 	for(var/list/group in GLOB.body_mod_organ_groups)
@@ -3184,15 +3248,22 @@
 		var/locked = prefs.body_mod_organ_locked(slot)
 		var/selected = null
 		var/stored = prefs.organ_mods[slot]
-		if(stored)
+		if(stored && prefs.body_mod_organ_option(slot, stored))
 			selected = stored
 		else
 			for(var/list/default_option in group["options"])
-				if(isnull(default_option["path"]))
+				if(prefs.body_mod_organ_option_available(slot, default_option) && isnull(default_option["path"]))
 					selected = default_option["id"]
 					break
+			if(isnull(selected))
+				for(var/list/fallback_option in group["options"])
+					if(prefs.body_mod_organ_option_available(slot, fallback_option))
+						selected = fallback_option["id"]
+						break
 		var/list/options = list()
 		for(var/list/option in group["options"])
+			if(!prefs.body_mod_organ_option_available(slot, option))
+				continue
 			options += list(list("id" = option["id"], "label" = option["label"], "cost" = option["cost"]))
 		var/list/group_row = list(
 			"slot" = slot,
@@ -3236,10 +3307,11 @@
 
 	var/datum/quirk/quirk_datum = SSquirks.quirks[quirk_name]
 	var/value = SSquirks.quirk_points[quirk_name]
+	// После очистки старого пресета дефицит можно исправлять постепенно, не сбрасывая весь набор.
+	var/balance = quirk_balance()
 
 	if(quirk_name in prefs.all_quirks)
-		var/balance = quirk_balance()
-		if(balance + value < 0)
+		if(balance + value < min(0, balance))
 			to_chat(user, span_warning("Возврат этого квирка увёл бы баланс в минус!"))
 			return
 		prefs.all_quirks -= quirk_name
@@ -3252,7 +3324,7 @@
 	if(prefs.GetPositiveQuirkCount() >= MAX_QUIRKS && value > 0)
 		to_chat(user, span_warning("Нельзя взять больше [MAX_QUIRKS] позитивных квирков!"))
 		return
-	if(quirk_balance() - value < 0)
+	if(balance - value < min(0, balance))
 		to_chat(user, span_warning("Недостаточно баланса для этого квирка!"))
 		return
 	prefs.all_quirks += quirk_name
@@ -3548,6 +3620,17 @@
 		return
 	if(QDELETED(src) || !prefs || preview_dirty)
 		return
+	show_preview_appearance(appearance_source)
+
+/datum/character_setup/proc/show_preview_appearance(mutable_appearance/appearance_source)
+	prune_viewer_screens()
+	// Новые слои меряются попиксельно, по 1-2 мс на слой: замеряем их заранее с уступкой тика.
+	for(var/viewer in viewer_screens)
+		var/atom/movable/screen/map_view/character_setup_screen/viewer_screen = viewer_screens[viewer]
+		viewer_screen.prewarm_preview_bounds(appearance_source)
+		break
+	if(QDELETED(src) || !prefs || preview_dirty)
+		return
 	prune_viewer_screens()
 	for(var/viewer in viewer_screens)
 		var/atom/movable/screen/map_view/character_setup_screen/viewer_screen = viewer_screens[viewer]
@@ -3620,7 +3703,7 @@
 
 		if("set_tab")
 			var/new_tab = num_param(params["tab"])
-			if(isnull(new_tab) || new_tab < GENERAL_CHAR_TAB || new_tab > MODIFICATIONS_CHAR_TAB)
+			if(isnull(new_tab) || new_tab < GENERAL_CHAR_TAB || new_tab > INNATE_CHAR_TAB)
 				return
 			prefs.character_settings_tab = new_tab
 			return TRUE
@@ -3655,10 +3738,12 @@
 				if(!prefs.load_character(new_slot, bypass_cooldown = TRUE))
 					prefs.default_slot = old_slot
 					return
+				// Номер слота load_character уже записал в файл, полная запись префов уходит отдельным тиком.
+				prefs.queue_save_pref(1, TRUE)
 			else
 				if(!prefs.create_character(new_slot))
 					return
-			prefs.save_preferences(bypass_cooldown = TRUE, silent = TRUE)
+				prefs.save_preferences(bypass_cooldown = TRUE, silent = TRUE)
 			prefs.parent?.tgui_panel?.emotes_send_list()
 			stop_sound_preview()
 			save_notice = save_previous ? "[previous_name]: сохранён автоматически при переключении." : null
@@ -4176,6 +4261,9 @@
 		if("quirk_toggle")
 			quirk_toggle(params)
 			return TRUE
+		if("innate_toggle")
+			toggle_innate_feature(params["id"])
+			return TRUE
 
 		if("quirk_reset")
 			quirk_reset()
@@ -4195,6 +4283,10 @@
 
 		if("quirk_set_nickname")
 			quirk_set_nickname(params)
+			return TRUE
+
+		if("quirk_set_distant_start")
+			prefs.distant_start_enabled = !!params["value"]
 			return TRUE
 
 		if("slot_export")
@@ -4709,7 +4801,13 @@ GLOBAL_LIST_EMPTY(character_preview_backgrounds)
 	apply_native_camera()
 
 // Границы видимых пикселей слоёв: слева, снизу, справа, сверху. Картинку персонажа не пересобираем.
-/atom/movable/screen/map_view/character_setup_screen/proc/measure_preview_bounds(image/source, list/icon_sizes, inherited_icon, inherited_state, inherited_dir = SOUTH)
+/atom/movable/screen/map_view/character_setup_screen/proc/prewarm_preview_bounds(mutable_appearance/appearance_source)
+	var/mutable_appearance/probe = new(appearance_source)
+	for(var/direction in GLOB.cardinals)
+		probe.dir = direction
+		measure_preview_bounds(probe, GLOB.character_preview_icon_bounds, allow_sleep = TRUE)
+
+/atom/movable/screen/map_view/character_setup_screen/proc/measure_preview_bounds(image/source, list/icon_sizes, inherited_icon, inherited_state, inherited_dir = SOUTH, allow_sleep = FALSE)
 	if(source.alpha <= 0)
 		return null
 	var/icon_file = source.icon || inherited_icon
@@ -4733,6 +4831,8 @@ GLOBAL_LIST_EMPTY(character_preview_backgrounds)
 			// Храним только числа; смена одежды и причёсок не должна растить кэш бесконечно.
 			if(length(icon_sizes) > CHARACTER_PREVIEW_BOUNDS_CACHE_MAX)
 				icon_sizes.Cut(1, CHARACTER_PREVIEW_BOUNDS_CACHE_MAX / 4 + 1)
+			if(allow_sleep)
+				CHECK_TICK
 		width = size[1]
 		height = size[2]
 		var/list/pixel_bounds = size[3]
@@ -4740,7 +4840,7 @@ GLOBAL_LIST_EMPTY(character_preview_backgrounds)
 
 	var/list/untransformed_bounds
 	for(var/image/child as anything in source.underlays + source.overlays)
-		var/list/child_bounds = measure_preview_bounds(child, icon_sizes, icon_file, state, direction)
+		var/list/child_bounds = measure_preview_bounds(child, icon_sizes, icon_file, state, direction, allow_sleep)
 		if(!child_bounds)
 			continue
 		child_bounds[1] += child.pixel_x + child.pixel_w

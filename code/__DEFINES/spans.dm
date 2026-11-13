@@ -85,6 +85,7 @@
 #define span_notice(str) ("<span class='notice'>" + (str) + "</span>")
 #define span_noticealien(str) ("<span class='noticealien'>" + (str) + "</span>")
 #define span_ooc(str) ("<span class='ooc'>" + (str) + "</span>")
+#define span_orange(str) ("<span style='color:" + COLOR_ORANGE + "'>" + (str) + "</span>")
 #define span_papyrus(str) ("<span class='papyrus'>" + (str) + "</span>")
 #define span_phobia(str) ("<span class='phobia'>" + (str) + "</span>")
 #define span_prefix(str) ("<span class='prefix'>" + (str) + "</span>")
@@ -177,4 +178,4 @@
 // Tooltips
 #define span_tooltip(str, tipstr, tipstyle, additional_classes, style) ("<span class='chat-tooltip[tipstyle == "" ? "" : " chat-tooltip--[tipstyle]"][additional_classes == "" ? "" : " [additional_classes]"]'[style == "" ? "" : " style='[style]'"]>[tipstr]<span class='chat-tooltip__content'>[str]</span></span>")
 #define span_tooltip_warning(str, tipstr) span_tooltip(str, tipstr, "warning", "", "")
-#define span_tooltip_fast(str) span_tooltip_warning(str, "\[?\]")
+#define span_tooltip_fast(str) span_tooltip_warning(str, "<span style='font-size: 75%; vertical-align: middle'>\[?\]</span>")

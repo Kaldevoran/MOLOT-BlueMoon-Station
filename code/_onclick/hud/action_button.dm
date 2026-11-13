@@ -21,6 +21,8 @@
 
 /atom/movable/screen/movable/action_button/Destroy()
 	if(our_hud)
+		if(our_hud.dragged_action_button == src)
+			our_hud.hide_landings()
 		var/mob/viewer = our_hud.mymob
 		our_hud.floating_actions -= src
 		if(location != SCRN_OBJ_DEFAULT)
@@ -51,6 +53,8 @@
 
 /atom/movable/screen/movable/action_button/Click(location,control,params)
 	var/mob/user = usr
+	our_hud?.hide_landings()
+	last_hovored_ref = null
 	if(QDELETED(src))
 		return
 	if(!can_use(user))
@@ -135,6 +139,9 @@
 
 /atom/movable/screen/movable/action_button/MouseEntered(location, control, params)
 	. = ..()
+	// у кнопок свои действия на ПКМ, меню BYOND над ними не нужно
+	if(usr.client)
+		usr.client.show_popup_menus = FALSE
 	if(!QDELETED(src))
 		var/extra_desc = desc || ""
 		var/ctrl_hint = (src.location == SCRN_OBJ_IN_PALETTE) ? "<br><b>Ctrl-click</b> to restore to hotbar" : "<br><b>Ctrl-click</b> to hide in Show Buttons"
@@ -144,16 +151,23 @@
 
 /atom/movable/screen/movable/action_button/MouseExited(location, control, params)
 	closeToolTip(usr)
+	usr.client?.refresh_popup_menus()
 	return ..()
 
-/atom/movable/screen/movable/action_button/MouseDrop(atom/over_object, mob/user, src_location, over_location, params)
+/atom/movable/screen/movable/action_button/MouseDrop(atom/over_object, src_location, over_location, src_control, over_control, params)
 	last_hovored_ref = null
 	if(QDELETED(src))
+		our_hud?.hide_landings()
 		return
 	if(!can_use(usr))
+		our_hud?.hide_landings()
 		return
 	var/datum/hud/active_hud = usr?.hud_used
 	if(!active_hud)
+		our_hud?.hide_landings()
+		return
+	if(over_object && QDELETED(over_object))
+		active_hud.hide_landings()
 		return
 	if(over_object == src)
 		active_hud.hide_landings()
